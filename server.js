@@ -2,25 +2,19 @@ const express = require("express");
 
 const app = express();
 
-// ENV VARS (set in Railway):
-// - CLARITY_API_TOKEN (required)
-// - SHARED_SECRET (recommended)
-// - PORT (provided by host)
 const { CLARITY_API_TOKEN, SHARED_SECRET, PORT = 3000 } = process.env;
 
 if (!CLARITY_API_TOKEN) {
   console.error("ERROR: Missing CLARITY_API_TOKEN env var.");
 }
 
-// Export endpoint base
 const CLARITY_EXPORT_URL =
   "https://www.clarity.ms/export-data/api/v1/project-live-insights";
 
-// Simple in-memory cache (keyed by days + dimension)
+// Cache to avoid hitting Clarity export limits
 const cache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-// Basic headers + OPTIONS
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -32,9 +26,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Optional API key auth (recommended)
 function requireApiKey(req, res, next) {
-  if (!SHARED_SECRET) return next(); // if not set, endpoint is public
+  if (!SHARED_SECRET) return next();
   const key = req.header("X-API-Key");
   if (!key || key !== SHARED_SECRET) return res.status(401).json({ error: "Unauthorized" });
   next();
@@ -50,24 +43,35 @@ function asNumber(v) {
   return 0;
 }
 
-// Detect adgroup_id from URL row
-function urlHasAdgroupId(urlValue, adgroupId) {
-  if (!urlValue || !adgroupId) return false;
-
-  const idStr = String(adgroupId);
+/**
+ * Normalize URL for matching:
+ * - keep origin + pathname only
+ * - drop query string and hash
+ * - decode pathname (best effort)
+ * This makes Final URL match Clarity URLs with tracking params.
+ */
+function normalizeUrlForMatch(input) {
+  if (!input) return "";
+  const s = String(input).trim();
+  if (!s) return "";
 
   try {
-    const u = new URL(String(urlValue));
-    return (u.searchParams.get("adgroup_id") || "") === idStr;
+    const u = new URL(s);
+    // normalize trailing slash
+    let path = u.pathname || "/";
+    // decode path if encoded (best effort)
+    try { path = decodeURI(path); } catch (_) {}
+    // remove trailing slash (except root)
+    if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+    return `${u.origin}${path}`;
   } catch {
-    // Fallback if it's not a full URL
-    const s = String(urlValue);
-    return s.includes(`adgroup_id=${encodeURIComponent(idStr)}`) || s.includes(`adgroup_id=${idStr}`);
+    // If it's not a valid absolute URL, fallback to simple cleanup
+    return s.split("?")[0].split("#")[0].replace(/\/$/, "");
   }
 }
 
 async function fetchClarityLiveInsights({ days = 3, dimension1 = "URL" }) {
-  const safeDays = Math.min(Math.max(parseInt(days, 10) || 3, 1), 3); // Clarity supports 1-3 days
+  const safeDays = Math.min(Math.max(parseInt(days, 10) || 3, 1), 3);
   const cacheKey = `${safeDays}|${dimension1}`;
   const now = Date.now();
 
@@ -97,19 +101,16 @@ async function fetchClarityLiveInsights({ days = 3, dimension1 = "URL" }) {
 }
 
 /**
- * Clarity export returns an array of metric blocks:
- * [
- *   { metricName: "Traffic", information: [ ... rows ... ] },
- *   { metricName: "Rage Click Count", information: [ ... ] },
- *   ...
- * ]
- *
- * Each row includes the dimension value (URL) and metric fields.
- * Field names can vary; we use resilient detection.
+ * Aggregates metrics for any row whose URL normalizes to the target.
+ * NOTE: Clarity export field names vary by metric block; this is best-effort mapping.
  */
-function aggregateByAdgroup(exportJson, adgroupId) {
+function aggregateByEntryUrl(exportJson, targetFinalUrl) {
+  const targetNorm = normalizeUrlForMatch(targetFinalUrl);
+
   const out = {
-    adgroup_id: String(adgroupId),
+    targetUrl: targetFinalUrl,
+    normalizedTarget: targetNorm,
+    matchedRows: 0,
     sessions: 0,
     users: 0,
     engagedSessions: 0,
@@ -129,33 +130,38 @@ function aggregateByAdgroup(exportJson, adgroupId) {
 
     for (const r of rows) {
       const rowUrl = r.URL || r.Url || r.url;
-      if (!urlHasAdgroupId(rowUrl, adgroupId)) continue;
+      const rowNorm = normalizeUrlForMatch(rowUrl);
 
-      // Traffic block commonly contains sessions + users
+      if (!rowNorm || rowNorm !== targetNorm) continue;
+      out.matchedRows += 1;
+
+      // Traffic
       if (metricName === "Traffic") {
         out.sessions += asNumber(r.totalSessionCount ?? r.sessionCount ?? r.sessions);
         out.users += asNumber(r.distantUserCount ?? r.userCount ?? r.users);
       }
 
+      // Rage clicks
       if (metricName === "Rage Click Count") {
         out.rageClicks += asNumber(r.rageClickCount ?? r.count ?? r.totalRageClickCount);
       }
 
+      // Dead clicks
       if (metricName === "Dead Click Count") {
         out.deadClicks += asNumber(r.deadClickCount ?? r.count ?? r.totalDeadClickCount);
       }
 
-      // Scrolls can come from scroll-related blocks; this is best-effort
+      // Scroll depth block (best effort)
       if (metricName === "Scroll Depth") {
         out.scrolls += asNumber(r.scrollCount ?? r.count ?? r.totalScrollCount);
       }
 
-      // Clicks may appear in Popular Pages or similar blocks; best-effort
+      // Popular pages block may include clicks (best effort)
       if (metricName === "Popular Pages") {
         out.clicks += asNumber(r.clickCount ?? r.clicks ?? r.totalClickCount ?? r.count);
       }
 
-      // Engagement Time: best-effort engaged sessions + duration
+      // Engagement time block (best effort)
       if (metricName === "Engagement Time") {
         out.engagedSessions += asNumber(r.engagedSessionCount ?? r.engagedSessions ?? r.count);
 
@@ -171,6 +177,7 @@ function aggregateByAdgroup(exportJson, adgroupId) {
   }
 
   if (durationCount > 0) out.avgSessionDuration = Math.round(durationSum / durationCount);
+
   return out;
 }
 
@@ -179,14 +186,26 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "clarity-proxy" });
 });
 
-// Main endpoint
-app.get("/adgroup/:id", requireApiKey, async (req, res) => {
-  const adgroupId = req.params.id;
-  const days = req.query.days || "3"; // default 3
+/**
+ * NEW: URL-based endpoint
+ * GET /metrics?url=<finalUrl>&days=3
+ */
+app.get("/metrics", requireApiKey, async (req, res) => {
+  const targetUrl = String(req.query.url || "").trim();
+  const days = req.query.days || "3";
+
+  if (!targetUrl) {
+    return res.status(400).json({ error: "Missing query param: url" });
+  }
+
+  // Safety: prevent absurdly long URLs
+  if (targetUrl.length > 2000) {
+    return res.status(400).json({ error: "URL too long" });
+  }
 
   try {
     const exportJson = await fetchClarityLiveInsights({ days, dimension1: "URL" });
-    const agg = aggregateByAdgroup(exportJson, adgroupId);
+    const agg = aggregateByEntryUrl(exportJson, targetUrl);
     res.json(agg);
   } catch (e) {
     console.error(e);
