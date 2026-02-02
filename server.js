@@ -233,6 +233,14 @@ app.get("/debug/urls", requireApiKey, async (req, res) => {
     res.status(502).json({ error: "Upstream error", message: String(e.message || e) });
   }
 });
+app.get("/debug/token", (req, res) => {
+  const t = process.env.CLARITY_API_TOKEN || "";
+  res.json({
+    hasToken: t.length > 0,
+    tokenLength: t.length
+  });
+});
 
 app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+
 
