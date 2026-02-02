@@ -212,5 +212,27 @@ app.get("/metrics", requireApiKey, async (req, res) => {
     res.status(502).json({ error: "Upstream error", message: String(e.message || e) });
   }
 });
+app.get("/debug/urls", requireApiKey, async (req, res) => {
+  const days = req.query.days || "3";
+  try {
+    const exportJson = await fetchClarityLiveInsights({ days, dimension1: "URL" });
+
+    const samples = [];
+    for (const block of Array.isArray(exportJson) ? exportJson : []) {
+      const rows = Array.isArray(block.information) ? block.information : [];
+      for (const r of rows) {
+        const rowUrl = r.URL || r.Url || r.url;
+        if (rowUrl && !samples.includes(String(rowUrl))) samples.push(String(rowUrl));
+        if (samples.length >= 150) break;
+      }
+      if (samples.length >= 150) break;
+    }
+
+    res.json({ days: Number(days), sampleCount: samples.length, samples });
+  } catch (e) {
+    res.status(502).json({ error: "Upstream error", message: String(e.message || e) });
+  }
+});
 
 app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+
