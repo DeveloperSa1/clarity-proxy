@@ -240,7 +240,28 @@ app.get("/debug/token", (req, res) => {
     tokenLength: t.length
   });
 });
+app.get("/debug/schema", requireApiKey, async (req, res) => {
+  const days = req.query.days || "3";
+  try {
+    const exportJson = await fetchClarityLiveInsights({ days, dimension1: "URL" });
+
+    const schema = (Array.isArray(exportJson) ? exportJson : []).map((block) => {
+      const rows = Array.isArray(block.information) ? block.information : [];
+      const sampleRow = rows[0] || {};
+      return {
+        metricName: block.metricName || null,
+        sampleKeys: Object.keys(sampleRow).slice(0, 80) // limit
+      };
+    });
+
+    res.json({ days: Number(days), blockCount: schema.length, schema });
+  } catch (e) {
+    res.status(502).json({ error: "Upstream error", message: String(e.message || e) });
+  }
+});
+
 
 app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+
 
 
